@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import http
 import logging
 import re
 import socket
-from collections.abc import Awaitable, Coroutine, Generator, Iterable, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Coroutine,
+    Generator,
+    Iterable,
+    Sequence,
+)
 from types import TracebackType
 from typing import Any, Callable, Mapping, Self, cast
 
@@ -21,7 +29,7 @@ from ..headers import (
 )
 from ..http11 import SERVER, Request, Response
 from ..protocol import CONNECTING, OPEN, Event
-from ..server import ServerProtocol
+from ..server import HandshakeGeneration, HandshakeStack, ServerProtocol
 from ..typing import LoggerLike, Origin, PathLike, StatusLike, Subprotocol
 from ..utils import get_socket_name
 from .connection import Connection, broadcast
@@ -33,6 +41,7 @@ __all__ = [
     "unix_serve",
     "ServerConnection",
     "Server",
+    "HandshakeGeneration",
     "basic_auth",
 ]
 
@@ -110,26 +119,17 @@ class ServerConnection(Connection):
         """
         return self.protocol.reject(status, text)
 
-    async def handshake(
-        self,
-        process_request: (
-            Callable[
-                [ServerConnection, Request],
-                Awaitable[Response | None] | Response | None,
-            ]
-            | None
-        ) = None,
-        process_response: (
-            Callable[
-                [ServerConnection, Request, Response],
-                Awaitable[Response | None] | Response | None,
-            ]
-            | None
-        ) = None,
-        server_header: str | None = SERVER,
-    ) -> None:
+    async def handshake(self, server_header: str | None = SERVER) -> None:
         """
         Perform the opening handshake.
+
+        The connection is booked on the opening-handshake generation current
+        when the request is received; generations pushed later don't affect it.
+        Request interception intents run before :meth:`~ServerProtocol.accept`;
+        response rewrite intents run after the response is decided. The
+        interception outlet, the accept outlet (including rejects), the
+        response rewrite outlet, and the shutdown 503 gate remain separate
+        stages.
 
         """
         await asyncio.wait(
@@ -138,13 +138,24 @@ class ServerConnection(Connection):
         )
 
         if self.request is not None:
-            response = None
+            # Capture the current generation before yielding again. Advancing
+            # generations during the handshake doesn't rebook the connection.
+            generation = self.server.handshakes.current
+            self.protocol.handshake_generation = generation
+            generation.book(self.id)
+            try:
+                response: Response | None = None
 
-            if process_request is not None:
+                # Request interception: a non-None response forces the
+                # response and skips accept().
                 try:
-                    response = process_request(self, self.request)
-                    if isinstance(response, Awaitable):
-                        response = await response
+                    for process_request in generation.request_interceptors:
+                        response = process_request(self, self.request)
+                        if isinstance(response, Awaitable):
+                            response = await response
+                        response = cast(Response | None, response)
+                        if response is not None:
+                            break
                 except Exception as exc:
                     self.protocol.handshake_exc = exc
                     self.logger.error("process_request failed", exc_info=True)
@@ -156,22 +167,30 @@ class ServerConnection(Connection):
                         ),
                     )
 
-            if response is None:
-                self.response = self.protocol.accept(self.request)
-            else:
-                assert isinstance(response, Response)  # help mypy
-                self.response = response
+                if response is None:
+                    self.response = self.protocol.accept(self.request)
+                else:
+                    generation.note_intercepted(self.id)
+                    self.response = response
 
-            if server_header is not None:
-                self.response.headers["Server"] = server_header
+                if server_header is not None:
+                    self.response.headers["Server"] = server_header
 
-            response = None
+                # Response rewrite: happens once the response is decided,
+                # whether it was forced by an interceptor or produced by
+                # accept().
+                response = None
 
-            if process_response is not None:
                 try:
-                    response = process_response(self, self.request, self.response)
-                    if isinstance(response, Awaitable):
-                        response = await response
+                    for process_response in generation.response_rewriters:
+                        rewritten = process_response(self, self.request, self.response)
+                        if isinstance(rewritten, Awaitable):
+                            rewritten = await rewritten
+                        rewritten = cast(Response | None, rewritten)
+                        if rewritten is not None:
+                            response = rewritten
+                            self.response = rewritten
+                            generation.note_rewritten(self.id)
                 except Exception as exc:
                     self.protocol.handshake_exc = exc
                     self.logger.error("process_response failed", exc_info=True)
@@ -183,26 +202,28 @@ class ServerConnection(Connection):
                         ),
                     )
 
-            if response is not None:
-                assert isinstance(response, Response)  # help mypy
-                self.response = response
+                if response is not None:
+                    assert isinstance(response, Response)  # help mypy
+                    self.response = response
 
-            # Reject the connection if the server started closing during the
-            # opening handshake. Don't yield before send_response() to avoid
-            # a race condition after checking if the server is closing.
-            if (
-                self.response.status_code == http.HTTPStatus.SWITCHING_PROTOCOLS
-                and not self.server.is_serving()
-            ):
-                self.response = self.protocol.reject(
-                    http.HTTPStatus.SERVICE_UNAVAILABLE,
-                    "Server is shutting down.\n",
-                )
+                # Reject the connection if the server started closing during the
+                # opening handshake. Don't yield before send_response() to avoid
+                # a race condition after checking if the server is closing.
+                if (
+                    self.response.status_code == http.HTTPStatus.SWITCHING_PROTOCOLS
+                    and not self.server.is_serving()
+                ):
+                    self.response = self.protocol.reject(
+                        http.HTTPStatus.SERVICE_UNAVAILABLE,
+                        "Server is shutting down.\n",
+                    )
 
-            # Don't respond if the connection was closed during the handshake.
-            if self.state is CONNECTING:
-                async with self.send_context(expected_state=CONNECTING):
-                    self.protocol.send_response(self.response)
+                # Don't respond if the connection was closed during the handshake.
+                if self.state is CONNECTING:
+                    async with self.send_context(expected_state=CONNECTING):
+                        self.protocol.send_response(self.response)
+            finally:
+                generation.unbook(self.id)
 
     def process_event(self, event: Event) -> None:
         """
@@ -242,6 +263,9 @@ class Server:
 
     Args:
         handler: Handler for one connection. It receives an asyncio protocol.
+        handshakes: Stack of opening-handshake generations. The root generation
+            binds the ``process_request`` and ``process_response`` arguments of
+            :func:`serve`. If :obj:`None`, an empty root generation is created.
         logger: Logger for this server.
             It defaults to ``logging.getLogger("websockets.server")``.
             See the :doc:`logging guide <../../topics/logging>` for details.
@@ -252,10 +276,14 @@ class Server:
         self,
         create_server: Callable[[], Coroutine[Any, Any, asyncio.Server]],
         handler: Callable[[ServerConnection], Coroutine[Any, Any, None]],
+        handshakes: HandshakeStack[ServerConnection] | None = None,
         logger: LoggerLike | None = None,
     ) -> None:
         self.create_server = create_server
         self.handler = handler
+        if handshakes is None:
+            handshakes = HandshakeStack(HandshakeGeneration())
+        self.handshakes = handshakes
         if logger is None:
             logger = logging.getLogger("websockets.server")
         self.logger = logger
@@ -286,6 +314,44 @@ class Server:
             for connection in self.all_connections
             if connection.protocol.state is OPEN
         }
+
+    @contextlib.asynccontextmanager
+    async def generation(
+        self,
+    ) -> AsyncIterator[HandshakeGeneration[ServerConnection]]:
+        """
+        Push a new generation of opening-handshake interception intents.
+
+        ::
+
+            async with server.generation() as handshakes:
+
+                @handshakes.process_request
+                async def process_request(connection, request):
+                    ...  # return a Response to force it, or None
+
+                @handshakes.process_response
+                async def process_response(connection, request, response):
+                    ...  # return a Response to replace it, or None
+
+        Connections whose opening handshake starts while the generation is
+        current are bound to its request interception and response rewrite
+        intents. The generation starts with a fresh ledger: intents of the
+        generation below don't apply to the new connections.
+
+        When the context exits, the generation is sealed and popped. It stops
+        receiving new handshakes and the previous generation resumes;
+        connections already booked on the popped generation complete against
+        the same ledger. Generations nest; if the context exits with an
+        exception, the generation is still popped cleanly.
+
+        """
+        generation: HandshakeGeneration[ServerConnection] = HandshakeGeneration()
+        self.handshakes.push(generation)
+        try:
+            yield generation
+        finally:
+            self.handshakes.pop()
 
     def close(
         self,
@@ -745,11 +811,7 @@ def serve(
             # Apply open_timeout to the WebSocket handshake.
             # Use ssl_handshake_timeout for the TLS handshake.
             async with asyncio.timeout(open_timeout):
-                await connection.handshake(
-                    process_request,
-                    process_response,
-                    server_header,
-                )
+                await connection.handshake(server_header)
 
             if connection.protocol.state is not OPEN:
                 connection.transport.abort()
@@ -773,9 +835,18 @@ def serve(
         finally:
             server.handler_tasks.discard(asyncio.current_task())
 
+    # The root generation is the bottom of the handshake stack. It binds the
+    # serve()-level callbacks and is never popped.
+    root: HandshakeGeneration[ServerConnection] = HandshakeGeneration()
+    if process_request is not None:
+        root.process_request(process_request)
+    if process_response is not None:
+        root.process_response(process_response)
+    handshakes = HandshakeStack(root)
+
     # The server variable is captured by the closure of conn_handler() and
     # protocol_factory().
-    server = Server(create_server, protocol_handler, logger)
+    server = Server(create_server, protocol_handler, handshakes, logger)
     return server
 
 

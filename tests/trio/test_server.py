@@ -888,3 +888,101 @@ class BasicAuthTests(EvalShellMixin, IsolatedTrioTestCase):
             str(raised.exception),
             "invalid credentials argument: [42]",
         )
+
+
+class HandshakeGenerationTests(EvalShellMixin, IsolatedTrioTestCase):
+    """
+    Opening-handshake interception/rewrite generations in the trio integration.
+
+    """
+
+    async def assert_rejects(self, uri, status_code):
+        """Connect, expect a rejection, and assert the response status."""
+        with self.assertRaises(InvalidStatus) as raised:
+            async with connect(uri, open_timeout=5):
+                self.fail("did not reject")
+        self.assertEqual(raised.exception.response.status_code, status_code)
+        return raised.exception.response
+
+    async def test_generation_advance_cuts_off_new_handshakes(self):
+        """Intents of generation N don't drive new handshakes after advancing."""
+        hold_entered = trio.Event()
+        release_hold = trio.Event()
+        gen1_ids = []
+
+        async def intercept(connection, request):
+            gen1_ids.append(connection.id)
+            if request.path == "/hold":
+                hold_entered.set()
+                await release_hold.wait()
+            return connection.respond(http.HTTPStatus.PAYMENT_REQUIRED, "gen1\n")
+
+        async with run_server() as server:
+            async with server.generation() as gen1:
+                gen1.process_request(intercept)
+
+                async with trio.open_nursery() as nursery:
+                    # C1 starts its handshake in gen1 and stays CONNECTING.
+                    nursery.start_soon(
+                        self.assert_rejects, get_uri(server) + "/hold", 402
+                    )
+                    await hold_entered.wait()
+                    self.assertEqual(gen1.booked, {gen1_ids[0]})
+
+                    # Advance to gen2: fresh ledger, no inherited interception.
+                    async with server.generation() as gen2:
+                        gen2_ids = []
+
+                        async def record(connection, request):
+                            gen2_ids.append(connection.id)
+
+                        gen2.process_request(record)
+                        async with connect(get_uri(server) + "/no-op", open_timeout=5):
+                            pass
+                        while gen2.booked:  # unbook follows the response.
+                            await trio.sleep(MS)
+
+                        # The new handshake went through accept() on gen2.
+                        self.assertEqual(gen2.accepted, {gen2_ids[0]})
+                        self.assertNotIn(gen2_ids[0], gen1_ids)
+                        self.assertEqual(gen1.booked, {gen1_ids[0]})
+
+                    # gen2 popped: gen1 resumes for new handshakes.
+                    self.assertTrue(gen2.sealed)
+                    self.assertIs(server.handshakes.current, gen1)
+                    await self.assert_rejects(get_uri(server) + "/resumed", 402)
+
+                    # The held connection completes with gen1's intent.
+                    release_hold.set()
+
+        self.assertEqual(gen1.intercepted, set(gen1_ids))
+        self.assertNotIn(gen1_ids[0], gen2.intercepted)
+
+    async def test_generation_pops_cleanly_on_exception(self):
+        """Exiting a generation with an exception still pops it."""
+        async with run_server() as server:
+            root = server.handshakes.current
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                async with server.generation() as generation:
+                    self.assertIs(server.handshakes.current, generation)
+                    raise RuntimeError("boom")
+
+            self.assertTrue(generation.sealed)
+            self.assertNotIn(generation, server.handshakes.generations)
+            self.assertIs(server.handshakes.current, root)
+
+    async def test_server_defaults_to_empty_root_generation(self):
+        """Server creates an empty root generation when none is provided."""
+
+        async def noop_handler(stream):
+            pass
+
+        listeners = await trio.open_tcp_listeners(0)
+        try:
+            server = Server(listeners, noop_handler)
+            self.assertEqual(server.handshakes.current.request_interceptors, [])
+            self.assertEqual(server.handshakes.current.response_rewriters, [])
+            self.assertFalse(server.handshakes.current.sealed)
+        finally:
+            for listener in listeners:
+                await listener.aclose()

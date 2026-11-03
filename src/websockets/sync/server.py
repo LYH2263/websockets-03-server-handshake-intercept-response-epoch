@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import hmac
 import http
 import logging
@@ -13,7 +14,7 @@ import sys
 import threading
 import time
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from types import TracebackType
 from typing import Any, Callable, Mapping, Self, cast
 
@@ -28,7 +29,7 @@ from ..headers import (
 )
 from ..http11 import SERVER, Request, Response
 from ..protocol import CONNECTING, OPEN, Event
-from ..server import ServerProtocol
+from ..server import HandshakeGeneration, HandshakeStack, ServerProtocol
 from ..typing import LoggerLike, Origin, PathLike, StatusLike, Subprotocol
 from ..utils import get_socket_name
 from .connection import Connection, broadcast
@@ -41,8 +42,38 @@ __all__ = [
     "unix_serve",
     "ServerConnection",
     "Server",
+    "HandshakeGeneration",
     "basic_auth",
 ]
+
+
+class ThreadSafeHandshakeStack(HandshakeStack["ServerConnection"]):
+    """
+    Opening-handshake generation stack for the threading integration.
+
+    Connection handlers run in separate threads and look up the current
+    generation while the host thread may push or pop generations. The lock
+    keeps the stack consistent; handlers snapshot the generation they book,
+    so later push/pop doesn't rebook them.
+
+    """
+
+    def __init__(self, root: HandshakeGeneration[ServerConnection]) -> None:
+        super().__init__(root)
+        self.lock = threading.Lock()
+
+    @property
+    def current(self) -> HandshakeGeneration[ServerConnection]:
+        with self.lock:
+            return super().current
+
+    def push(self, generation: HandshakeGeneration[ServerConnection]) -> None:
+        with self.lock:
+            super().push(generation)
+
+    def pop(self) -> HandshakeGeneration[ServerConnection]:
+        with self.lock:
+            return super().pop()
 
 
 class ServerConnection(Connection):
@@ -121,36 +152,43 @@ class ServerConnection(Connection):
 
     def handshake(
         self,
-        process_request: (
-            Callable[
-                [ServerConnection, Request],
-                Response | None,
-            ]
-            | None
-        ) = None,
-        process_response: (
-            Callable[
-                [ServerConnection, Request, Response],
-                Response | None,
-            ]
-            | None
-        ) = None,
         server_header: str | None = SERVER,
         timeout: float | None = None,
     ) -> None:
         """
         Perform the opening handshake.
 
+        The connection is booked on the opening-handshake generation current
+        when the request is received; generations pushed later don't affect it.
+        Request interception intents run before :meth:`~ServerProtocol.accept`;
+        response rewrite intents run after the response is decided. The
+        interception outlet, the accept outlet (including rejects), the
+        response rewrite outlet, and the shutdown 503 gate remain separate
+        stages.
+
         """
         if not self.request_rcvd.wait(timeout):
             raise TimeoutError("timed out while waiting for handshake request")
 
         if self.request is not None:
-            response = None
+            # Snapshot the current generation. Connection handlers run in
+            # separate threads; advancing generations doesn't rebook them.
+            generation = self.server.handshakes.current
+            self.protocol.handshake_generation = generation
+            generation.book(self.id)
+            try:
+                response: Response | None = None
 
-            if process_request is not None:
+                # Request interception: a non-None response forces the
+                # response and skips accept().
                 try:
-                    response = process_request(self, self.request)
+                    for process_request in generation.request_interceptors:
+                        response = cast(
+                            Response | None,
+                            process_request(self, self.request),
+                        )
+                        if response is not None:
+                            break
                 except Exception as exc:
                     self.protocol.handshake_exc = exc
                     self.logger.error("process_request failed", exc_info=True)
@@ -162,19 +200,30 @@ class ServerConnection(Connection):
                         ),
                     )
 
-            if response is None:
-                self.response = self.protocol.accept(self.request)
-            else:
-                self.response = response
+                if response is None:
+                    self.response = self.protocol.accept(self.request)
+                else:
+                    generation.note_intercepted(self.id)
+                    self.response = response
 
-            if server_header is not None:
-                self.response.headers["Server"] = server_header
+                if server_header is not None:
+                    self.response.headers["Server"] = server_header
 
-            response = None
+                # Response rewrite: happens once the response is decided,
+                # whether it was forced by an interceptor or produced by
+                # accept().
+                response = None
 
-            if process_response is not None:
                 try:
-                    response = process_response(self, self.request, self.response)
+                    for process_response in generation.response_rewriters:
+                        rewritten = cast(
+                            Response | None,
+                            process_response(self, self.request, self.response),
+                        )
+                        if rewritten is not None:
+                            response = rewritten
+                            self.response = rewritten
+                            generation.note_rewritten(self.id)
                 except Exception as exc:
                     self.protocol.handshake_exc = exc
                     self.logger.error("process_response failed", exc_info=True)
@@ -189,22 +238,24 @@ class ServerConnection(Connection):
                 if response is not None:
                     self.response = response
 
-            # Reject the connection if the server started closing during the
-            # opening handshake. shutdown() runs a loop to catch cases where
-            # the server shuts down between this check and send_response().
-            if (
-                self.response.status_code == http.HTTPStatus.SWITCHING_PROTOCOLS
-                and self.server.socket_closed.is_set()
-            ):
-                self.response = self.protocol.reject(
-                    http.HTTPStatus.SERVICE_UNAVAILABLE,
-                    "Server is shutting down.\n",
-                )
+                # Reject the connection if the server started closing during the
+                # opening handshake. shutdown() runs a loop to catch cases where
+                # the server shuts down between this check and send_response().
+                if (
+                    self.response.status_code == http.HTTPStatus.SWITCHING_PROTOCOLS
+                    and self.server.socket_closed.is_set()
+                ):
+                    self.response = self.protocol.reject(
+                        http.HTTPStatus.SERVICE_UNAVAILABLE,
+                        "Server is shutting down.\n",
+                    )
 
-            # Don't respond if the connection was closed during the handshake.
-            if self.state is CONNECTING:
-                with self.send_context(expected_state=CONNECTING):
-                    self.protocol.send_response(self.response)
+                # Don't respond if the connection was closed during the handshake.
+                if self.state is CONNECTING:
+                    with self.send_context(expected_state=CONNECTING):
+                        self.protocol.send_response(self.response)
+            finally:
+                generation.unbook(self.id)
 
     def process_event(self, event: Event) -> None:
         """
@@ -242,6 +293,9 @@ class Server:
         socket: Server socket accepting new connections.
         handler: Handler for one connection. It receives the socket and address
             returned by :meth:`~socket.socket.accept`.
+        handshakes: Stack of opening-handshake generations. The root generation
+            binds the ``process_request`` and ``process_response`` arguments of
+            :func:`serve`. If :obj:`None`, an empty root generation is created.
         logger: Logger for this server.
             It defaults to ``logging.getLogger("websockets.server")``.
             See the :doc:`logging guide <../../topics/logging>` for details.
@@ -254,10 +308,14 @@ class Server:
         self,
         sock: socket.socket,
         handler: Callable[[socket.socket, Any], None],
+        handshakes: ThreadSafeHandshakeStack | None = None,
         logger: LoggerLike | None = None,
     ) -> None:
         self.socket = sock
         self.handler = handler
+        if handshakes is None:
+            handshakes = ThreadSafeHandshakeStack(HandshakeGeneration())
+        self.handshakes = handshakes
         if logger is None:
             logger = logging.getLogger("websockets.server")
         self.logger = logger
@@ -294,6 +352,45 @@ class Server:
                 for connection in self.all_connections
                 if connection.protocol.state is OPEN
             }
+
+    @contextlib.contextmanager
+    def generation(self) -> Iterator[HandshakeGeneration[ServerConnection]]:
+        """
+        Push a new generation of opening-handshake interception intents.
+
+        ::
+
+            with server.generation() as handshakes:
+
+                @handshakes.process_request
+                def process_request(connection, request):
+                    ...  # return a Response to force it, or None
+
+                @handshakes.process_response
+                def process_response(connection, request, response):
+                    ...  # return a Response to replace it, or None
+
+        Connections whose opening handshake starts while the generation is
+        current are bound to its request interception and response rewrite
+        intents. The generation starts with a fresh ledger: intents of the
+        generation below don't apply to the new connections.
+
+        When the context exits, the generation is sealed and popped. It stops
+        receiving new handshakes and the previous generation resumes;
+        connections already booked on the popped generation complete against
+        the same ledger. Generations nest; if the context exits with an
+        exception, the generation is still popped cleanly.
+
+        Callbacks are synchronous, like the ``process_request`` and
+        ``process_response`` arguments of :func:`serve`.
+
+        """
+        generation: HandshakeGeneration[ServerConnection] = HandshakeGeneration()
+        self.handshakes.push(generation)
+        try:
+            yield generation
+        finally:
+            self.handshakes.pop()
 
     def serve_forever(self) -> None:
         """
@@ -762,12 +859,7 @@ def serve(
                     server.handler_threads.discard(threading.current_thread())
 
         try:
-            connection.handshake(
-                process_request,
-                process_response,
-                server_header,
-                deadline.timeout(),
-            )
+            connection.handshake(server_header, deadline.timeout())
 
             if connection.protocol.state is not OPEN:
                 connection.close_socket()
@@ -796,8 +888,17 @@ def serve(
 
     # Initialize server
 
+    # The root generation is the bottom of the handshake stack. It binds the
+    # serve()-level callbacks and is never popped.
+    root: HandshakeGeneration[ServerConnection] = HandshakeGeneration()
+    if process_request is not None:
+        root.process_request(process_request)
+    if process_response is not None:
+        root.process_response(process_response)
+    handshakes = ThreadSafeHandshakeStack(root)
+
     # The server variable is captured by the closure of sock_handler().
-    server = Server(sock, sock_handler, logger)
+    server = Server(sock, sock_handler, handshakes, logger)
     return server
 
 

@@ -148,6 +148,33 @@ class RouterTests(EvalShellMixin, unittest.TestCase):
             with connect(get_uri(server)) as client:
                 self.assertEval(client, "ws.my_router_ran", "True")
 
+    def test_generation_shadows_router_dispatch(self):
+        """Router dispatch rides the root generation and is shadowable."""
+
+        def reject_status(server, path):
+            with self.assertRaises(InvalidStatus) as raised:
+                with connect(get_uri(server) + path, open_timeout=5):
+                    self.fail("did not raise")
+            return raised.exception.response.status_code
+
+        with run_router(url_map) as server:
+            # The router is an interceptor of the root generation: /n is 404.
+            self.assertEqual(reject_status(server, "/n"), 404)
+
+            with server.generation() as generation:
+
+                def force(connection, _request):
+                    return connection.respond(http.HTTPStatus.PAYMENT_REQUIRED, "gen\n")
+
+                generation.process_request(force)
+
+                # A fresh ledger drives the handshake; the router doesn't run.
+                self.assertEqual(reject_status(server, "/n"), 402)
+                self.assertEqual(len(generation.intercepted), 1)
+
+            # Popping the generation restores router dispatch on the root.
+            self.assertEqual(reject_status(server, "/n"), 404)
+
 
 @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "this test requires Unix sockets")
 @unittest.skipUnless("werkzeug" in sys.modules, "werkzeug not installed")

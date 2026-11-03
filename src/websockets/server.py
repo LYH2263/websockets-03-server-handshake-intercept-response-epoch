@@ -5,9 +5,10 @@ import binascii
 import email.utils
 import http
 import re
+import uuid
 import warnings
 from collections.abc import Generator, Sequence
-from typing import Any, Callable, cast
+from typing import Any, Callable, Generic, TypeVar, cast
 
 from .datastructures import Headers, MultipleValuesError
 from .exceptions import (
@@ -48,6 +49,155 @@ from .utils import accept_key
 
 
 __all__ = ["ServerProtocol"]
+
+
+ConnectionT = TypeVar("ConnectionT")
+HookT = TypeVar("HookT", bound=Callable[..., Any])
+
+
+class HandshakeGeneration(Generic[ConnectionT]):
+    """
+    Ledger of opening-handshake intents for one generation of a server.
+
+    A generation binds two kinds of intents:
+
+    * request interception intents, registered with :meth:`process_request`,
+      run before :meth:`ServerProtocol.accept`; the first one to return a
+      :class:`~websockets.http11.Response` forces the response and skips
+      :meth:`~ServerProtocol.accept`;
+    * response rewrite intents, registered with :meth:`process_response`,
+      run after the response is decided; returning a
+      :class:`~websockets.http11.Response` replaces it.
+
+    A connection whose opening handshake starts while the generation is
+    current is *booked* on the generation. The two outlets stay separate: a
+    forced response never calls :meth:`~ServerProtocol.accept`; connections
+    that went through :meth:`~ServerProtocol.accept`, including rejects, are
+    recorded in :attr:`accepted`, while connections whose response was forced
+    before :meth:`~ServerProtocol.accept` are recorded in :attr:`intercepted`.
+    Connections whose response was replaced by a rewrite intent are recorded
+    in :attr:`rewritten`.
+
+    Sealing a generation with :meth:`seal` prevents registering more intents.
+    It does not affect connections already booked on the generation.
+
+    The list of callbacks is I/O-agnostic: the threading integration invokes
+    them synchronously, while the asyncio integration awaits awaitable
+    callbacks.
+
+    """
+
+    def __init__(self) -> None:
+        # Request interception intents and response rewrite intents are kept
+        # on separate ledgers; they run at distinct stages of the handshake.
+        self.request_interceptors: list[Callable[..., Any]] = []
+        self.response_rewriters: list[Callable[..., Any]] = []
+        # Connections currently in the opening handshake, by connection id.
+        self.booked: set[uuid.UUID] = set()
+        # Connections whose response was forced before accept(), by id.
+        self.intercepted: set[uuid.UUID] = set()
+        # Connections for which accept() was called, by id.
+        self.accepted: set[uuid.UUID] = set()
+        # Connections whose response was replaced by a rewrite intent, by id.
+        self.rewritten: set[uuid.UUID] = set()
+        # A sealed generation rejects new intents.
+        self.sealed = False
+
+    def process_request(self, callback: HookT) -> HookT:
+        """
+        Register a request interception intent with this generation.
+
+        The callback has the same signature as the ``process_request``
+        argument of :func:`~websockets.asyncio.server.serve`. It may return a
+        :class:`~websockets.http11.Response` to force it and skip
+        :meth:`ServerProtocol.accept`, or :obj:`None` to continue the
+        handshake.
+
+        This method returns its argument, so it can be used as a decorator.
+
+        """
+        if self.sealed:
+            raise RuntimeError(
+                "cannot add a process_request intent to a sealed generation"
+            )
+        self.request_interceptors.append(callback)
+        return callback
+
+    def process_response(self, callback: HookT) -> HookT:
+        """
+        Register a response rewrite intent with this generation.
+
+        The callback has the same signature as the ``process_response``
+        argument of :func:`~websockets.asyncio.server.serve`. It may return a
+        :class:`~websockets.http11.Response` to replace the response, or
+        :obj:`None` to leave it unchanged.
+
+        This method returns its argument, so it can be used as a decorator.
+
+        """
+        if self.sealed:
+            raise RuntimeError(
+                "cannot add a process_response intent to a sealed generation"
+            )
+        self.response_rewriters.append(callback)
+        return callback
+
+    def book(self, connection_id: uuid.UUID) -> None:
+        """Book a connection whose opening handshake starts in this generation."""
+        self.booked.add(connection_id)
+
+    def unbook(self, connection_id: uuid.UUID) -> None:
+        """Release a connection when its opening handshake completes."""
+        self.booked.discard(connection_id)
+
+    def note_intercepted(self, connection_id: uuid.UUID) -> None:
+        """Record that a response was forced before accept()."""
+        self.intercepted.add(connection_id)
+
+    def note_accepted(self, connection_id: uuid.UUID) -> None:
+        """Record that accept() ran for a booked connection."""
+        self.accepted.add(connection_id)
+
+    def note_rewritten(self, connection_id: uuid.UUID) -> None:
+        """Record that a response rewrite intent replaced the response."""
+        self.rewritten.add(connection_id)
+
+    def seal(self) -> None:
+        """Seal the generation, preventing new intents from being registered."""
+        self.sealed = True
+
+
+class HandshakeStack(Generic[ConnectionT]):
+    """
+    Stack of opening-handshake generations on a server.
+
+    The generation on top of the stack receives connections whose opening
+    handshake starts. Pushing a generation starts a fresh ledger: it does not
+    inherit intents from the generation below. Popping the current generation
+    seals it and restores the previous generation for new handshakes, without
+    affecting connections already booked on the popped generation.
+
+    """
+
+    def __init__(self, root: HandshakeGeneration[ConnectionT]) -> None:
+        # The root generation holds the serve()-level process_request and
+        # process_response callbacks; it is never popped.
+        self.generations: list[HandshakeGeneration[ConnectionT]] = [root]
+
+    @property
+    def current(self) -> HandshakeGeneration[ConnectionT]:
+        """Generation that receives opening handshakes at this point in time."""
+        return self.generations[-1]
+
+    def push(self, generation: HandshakeGeneration[ConnectionT]) -> None:
+        """Make a new generation receive opening handshakes."""
+        self.generations.append(generation)
+
+    def pop(self) -> HandshakeGeneration[ConnectionT]:
+        """Seal the current generation and restore the previous one."""
+        generation = self.generations.pop()
+        generation.seal()
+        return generation
 
 
 class ServerProtocol(Protocol):
@@ -117,6 +267,10 @@ class ServerProtocol(Protocol):
         # True when a WebSocket handshake was attempted via accept();
         # False when a plain HTTP response sent by process_request().
         self.accept_called = False
+        # Opening-handshake generation on which this connection is booked,
+        # if any. accept() records itself on it so that the accept path,
+        # including rejects, stays distinguishable from forced responses.
+        self.handshake_generation: HandshakeGeneration[Any] | None = None
 
     def accept(self, request: Request) -> Response:
         """
@@ -141,6 +295,8 @@ class ServerProtocol(Protocol):
 
         """
         self.accept_called = True
+        if self.handshake_generation is not None:
+            self.handshake_generation.note_accepted(self.id)
         try:
             (
                 accept_header,

@@ -23,6 +23,7 @@ __all__ = [
     "unix_serve",
     "ServerConnection",
     "Server",
+    "HandshakeGeneration",
     # .client
     "ClientProtocol",
     # .datastructures
@@ -92,6 +93,7 @@ if TYPE_CHECKING:
     from .asyncio.client import ClientConnection, connect, unix_connect
     from .asyncio.router import Router, route, unix_route
     from .asyncio.server import (
+        HandshakeGeneration,
         Server,
         ServerConnection,
         basic_auth,
@@ -168,6 +170,7 @@ else:
             "unix_serve": ".asyncio.server",
             "ServerConnection": ".asyncio.server",
             "Server": ".asyncio.server",
+            "HandshakeGeneration": ".asyncio.server",
             # .client
             "ClientProtocol": ".client",
             # .datastructures

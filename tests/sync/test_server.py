@@ -817,3 +817,318 @@ class BackwardsCompatibilityTests(DeprecationTestCase):
         with self.assertDeprecationWarning("WebSocketServer was renamed to Server"):
             from websockets.sync.server import WebSocketServer
         self.assertIs(WebSocketServer, Server)
+
+
+class HandshakeGenerationTests(LoggingTestCase, unittest.TestCase):
+    """
+    Opening-handshake interception/rewrite generations in the threading
+    integration.
+
+    These tests observe causality across connections of ONE server, with
+    handshakes running in separate threads: an intent bound to generation N
+    stops driving new CONNECTING handshakes once N+1 is pushed; pre-accept
+    interception, accept() (including rejects), response rewriting, and the
+    shutdown 503 gate remain separate outlets.
+
+    """
+
+    def reject_response(self, uri, **kwargs):
+        """Connect, expect a rejection, and return the parsed response."""
+        with self.assertRaises(InvalidStatus) as raised:
+            with connect(uri, open_timeout=5, **kwargs):
+                self.fail("did not reject")
+        return raised.exception.response
+
+    def connect_in_background(self, uri, box):
+        """Run a rejected connection in a thread and record its status."""
+
+        def run():
+            try:
+                with connect(uri, open_timeout=5):
+                    box["status"] = 101
+            except InvalidStatus as exc:
+                box["status"] = exc.response.status_code
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        return thread
+
+    def test_generation_advance_cuts_off_new_handshakes(self):
+        """Intents of generation N don't drive new handshakes after advancing."""
+        hold_entered = threading.Event()
+        release_hold = threading.Event()
+        gen1_ids = []
+
+        def intercept(connection, request):
+            gen1_ids.append(connection.id)
+            if request.path == "/hold":
+                hold_entered.set()
+                release_hold.wait()
+            return connection.respond(http.HTTPStatus.PAYMENT_REQUIRED, "gen1\n")
+
+        with run_server() as server:
+            with server.generation() as gen1:
+                gen1.process_request(intercept)
+
+                # C1 starts its handshake in gen1 and stays CONNECTING there.
+                held = {}
+                thread = self.connect_in_background(get_uri(server) + "/hold", held)
+                self.assertTrue(hold_entered.wait(5))
+                self.assertEqual(gen1.booked, {gen1_ids[0]})
+
+                # Advance to gen2: fresh ledger, no inherited interception.
+                with server.generation() as gen2:
+                    gen2_ids = []
+
+                    def record(connection, request):
+                        gen2_ids.append(connection.id)
+
+                    gen2.process_request(record)
+                    with connect(get_uri(server) + "/no-op", open_timeout=5):
+                        pass
+                    while gen2.booked:  # unbook follows the response.
+                        time.sleep(MS)
+
+                    # The new handshake went through accept() on gen2.
+                    self.assertEqual(gen2.accepted, {gen2_ids[0]})
+                    self.assertEqual(gen2.intercepted, set())
+                    self.assertNotIn(gen2_ids[0], gen1_ids)
+                    self.assertEqual(gen1.booked, {gen1_ids[0]})
+
+                # gen2 popped: gen1 resumes for new handshakes.
+                self.assertTrue(gen2.sealed)
+                self.assertIs(server.handshakes.current, gen1)
+                response = self.reject_response(get_uri(server) + "/resumed")
+                self.assertEqual(response.status_code, 402)
+
+                # The held connection completes with gen1's intent.
+                release_hold.set()
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(held["status"], 402)
+
+        self.assertEqual(gen1.intercepted, set(gen1_ids))
+        self.assertNotIn(gen1_ids[0], gen2.intercepted)
+
+    def test_intercept_and_accept_reject_stay_separate(self):
+        """Forced response without accept() vs reject after accept() fork."""
+        seen = []
+
+        def record(connection, request):
+            seen.append((connection, request.path))
+
+        def force(connection, request):
+            if request.path == "/forced":
+                return connection.respond(http.HTTPStatus.PAYMENT_REQUIRED, "forced\n")
+            return None
+
+        with self.assertLogs("websockets", logging.INFO) as logs:
+            with run_server(origins=[]) as server:
+                with server.generation() as generation:
+                    generation.process_request(record)
+                    generation.process_request(force)
+
+                    # Host interception forces 402 before accept().
+                    response = self.reject_response(get_uri(server) + "/forced")
+                    self.assertEqual(response.status_code, 402)
+                    # No acceptable origin: interception returns None, then
+                    # accept() rejects with 403.
+                    response = self.reject_response(get_uri(server) + "/")
+                    self.assertEqual(response.status_code, 403)
+
+        forced_ws, _ = seen[0]
+        rejected_ws, _ = seen[1]
+        self.assertFalse(forced_ws.protocol.accept_called)
+        self.assertTrue(rejected_ws.protocol.accept_called)
+        self.assertEqual(generation.intercepted, {forced_ws.id})
+        self.assertEqual(generation.accepted, {rejected_ws.id})
+        messages = "".join(record.getMessage() for record in logs.records)
+        self.assertIn("HTTP response sent (402 Payment Required)", messages)
+        self.assertIn("connection rejected (403 Forbidden)", messages)
+
+    def test_process_response_rewrite_forks_from_interception(self):
+        """Response rewrite is a separate outlet from pre-accept interception."""
+        forced_ids = []
+        rewritten_ids = []
+
+        def force(connection, request):
+            if request.path == "/teapot":
+                forced_ids.append(connection.id)
+                return connection.respond(http.HTTPStatus.IM_A_TEAPOT, "teapot\n")
+            return None
+
+        def rewrite(connection, _request, response):
+            rewritten_ids.append(connection.id)
+            headers = response.headers.copy()
+            headers["X-Generation"] = "1"
+            return dataclasses.replace(response, headers=headers)
+
+        with run_server() as server:
+            with server.generation() as generation:
+                generation.process_request(force)
+                generation.process_response(rewrite)
+
+                # Forced before accept(): 418, then rewritten.
+                teapot = self.reject_response(get_uri(server) + "/teapot")
+                self.assertEqual(teapot.status_code, 418)
+                self.assertEqual(teapot.headers["X-Generation"], "1")
+
+                # Normal accept() path: 101, then rewritten.
+                with connect(get_uri(server) + "/no-op", open_timeout=5) as client:
+                    self.assertEqual(client.response.headers["X-Generation"], "1")
+
+        # The two outlets land in different ledgers; rewrite spans both.
+        self.assertEqual(generation.intercepted, set(forced_ids))
+        self.assertEqual(generation.rewritten, set(rewritten_ids))
+        self.assertEqual(generation.accepted, set(rewritten_ids) - set(forced_ids))
+
+    def test_shutdown_gate_and_callback_reject_stay_separate(self):
+        """503 shutdown gate doesn't collapse with an active callback reject."""
+        hold_entered = threading.Event()
+        release_hold = threading.Event()
+        held_ids = []
+        rejected_ids = []
+
+        def intercept(connection, request):
+            if request.path == "/hold":
+                held_ids.append(connection.id)
+                hold_entered.set()
+                release_hold.wait()
+                return None
+            if request.path == "/reject":
+                rejected_ids.append(connection.id)
+                return connection.respond(http.HTTPStatus.FORBIDDEN, "no\n")
+            return None
+
+        with run_server() as server:
+            with server.generation() as generation:
+                generation.process_request(intercept)
+
+                # C1 is CONNECTING, parked inside the interception intent.
+                held = {}
+                thread = self.connect_in_background(get_uri(server) + "/hold", held)
+                self.assertTrue(hold_entered.wait(5))
+
+                # C2 is rejected explicitly by the callback while serving.
+                response = self.reject_response(get_uri(server) + "/reject")
+                self.assertEqual(response.status_code, 403)
+
+                # Closing flips only the pending 101 of C1 to 503.
+                shutdown_thread = threading.Thread(target=server.shutdown)
+                shutdown_thread.start()
+                self.assertTrue(server.socket_closed.wait(5))
+                release_hold.set()
+                thread.join(5)
+                shutdown_thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertFalse(shutdown_thread.is_alive())
+
+        self.assertEqual(held["status"], 503)
+        # C1 ran accept() (101) before the gate rewrote it to 503; C2 never did.
+        self.assertEqual(generation.accepted, set(held_ids))
+        self.assertEqual(generation.intercepted, set(rejected_ids))
+
+    def test_nested_generations_do_not_cross_on_same_server(self):
+        """Inner generation never touches outer-ledger pending intents."""
+        outer_entered = threading.Event()
+        release_outer = threading.Event()
+        outer_ids = []
+        inner_ids = []
+
+        def outer_intercept(connection, request):
+            outer_ids.append(connection.id)
+            if request.path == "/slow":
+                outer_entered.set()
+                release_outer.wait()
+            return connection.respond(http.HTTPStatus.PAYMENT_REQUIRED, "outer\n")
+
+        with run_server() as server:
+            with server.generation() as outer:
+                outer.process_request(outer_intercept)
+
+                # An outer connection hangs CONNECTING with its intent pending.
+                held = {}
+                thread = self.connect_in_background(get_uri(server) + "/slow", held)
+                self.assertTrue(outer_entered.wait(5))
+
+                # Exiting the inner generation with an exception must still
+                # pop it cleanly.
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    with server.generation() as inner:
+
+                        def inner_intercept(connection, _request):
+                            inner_ids.append(connection.id)
+                            return connection.respond(
+                                http.HTTPStatus.IM_A_TEAPOT, "inner\n"
+                            )
+
+                        inner.process_request(inner_intercept)
+
+                        # A new handshake is driven by inner, never by outer.
+                        response = self.reject_response(get_uri(server) + "/")
+                        self.assertEqual(response.status_code, 418)
+                        while inner.booked:  # unbook follows the response.
+                            time.sleep(MS)
+
+                        # The outer pending connection isn't on inner's ledger.
+                        self.assertEqual(inner.booked, set())
+                        self.assertEqual(outer.booked, {outer_ids[0]})
+
+                        raise RuntimeError("boom")
+
+                self.assertTrue(inner.sealed)
+                self.assertNotIn(inner, server.handshakes.generations)
+                self.assertIs(server.handshakes.current, outer)
+
+                # Outer resumes for new handshakes.
+                response = self.reject_response(get_uri(server) + "/")
+                self.assertEqual(response.status_code, 402)
+
+                # The held outer intent completes untouched by inner ledger.
+                release_outer.set()
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(held["status"], 402)
+
+        self.assertEqual(inner.intercepted, set(inner_ids))
+        self.assertEqual(outer.intercepted, set(outer_ids))
+
+    def test_root_generation_binds_serve_level_callbacks(self):
+        """serve()-level callbacks live on the root generation and keep working."""
+
+        def root_intercept(connection, _request):
+            return connection.respond(http.HTTPStatus.IM_A_TEAPOT, "root\n")
+
+        with run_server(process_request=root_intercept) as server:
+            root = server.handshakes.current
+            self.assertFalse(root.sealed)
+            response = self.reject_response(get_uri(server) + "/")
+            self.assertEqual(response.status_code, 418)
+
+            # A fresh generation shadows the root ledger.
+            with server.generation() as generation:
+                with connect(get_uri(server) + "/no-op", open_timeout=5):
+                    pass
+
+            self.assertTrue(generation.sealed)
+            with self.assertRaisesRegex(RuntimeError, "sealed generation"):
+                generation.process_request(root_intercept)
+            with self.assertRaisesRegex(RuntimeError, "sealed generation"):
+                generation.process_response(lambda connection, request, r: None)
+
+            # Root ledger resumes.
+            response = self.reject_response(get_uri(server) + "/")
+            self.assertEqual(response.status_code, 418)
+            self.assertIs(server.handshakes.current, root)
+
+    def test_server_defaults_to_empty_root_generation(self):
+        """Server creates an empty root generation when none is provided."""
+
+        def sock_handler(sock, addr):
+            pass
+
+        with socket.create_server(("localhost", 0)) as sock:
+            server = Server(sock, sock_handler)
+            self.assertEqual(server.handshakes.current.request_interceptors, [])
+            self.assertEqual(server.handshakes.current.response_rewriters, [])
+            self.assertFalse(server.handshakes.current.sealed)

@@ -44,6 +44,14 @@ Running a server
 
     .. autoattribute:: sockets
 
+    .. automethod:: generation
+
+Handshake generations
+---------------------
+
+.. autoclass:: HandshakeGeneration
+    :members: process_request, process_response, booked, intercepted, accepted, rewritten, sealed
+
 Using a connection
 ------------------
 

@@ -183,6 +183,35 @@ class RouterTests(EvalShellMixin, unittest.IsolatedAsyncioTestCase):
             async with connect(get_uri(server)) as client:
                 await self.assertEval(client, "ws.my_router_ran", "True")
 
+    async def test_generation_shadows_router_dispatch(self):
+        """Router dispatch rides the root generation and is shadowable."""
+        async with route(url_map, "localhost", 0) as server:
+            # The router is an interceptor of the root generation: /n is 404.
+            with self.assertRaises(InvalidStatus) as raised:
+                async with connect(get_uri(server) + "/n"):
+                    self.fail("did not raise")
+            self.assertEqual(raised.exception.response.status_code, 404)
+
+            async with server.generation() as generation:
+
+                async def force(connection, _request):
+                    return connection.respond(http.HTTPStatus.PAYMENT_REQUIRED, "gen\n")
+
+                generation.process_request(force)
+
+                # A fresh ledger drives the handshake; the router doesn't run.
+                with self.assertRaises(InvalidStatus) as raised:
+                    async with connect(get_uri(server) + "/n"):
+                        self.fail("did not raise")
+                self.assertEqual(raised.exception.response.status_code, 402)
+                self.assertEqual(len(generation.intercepted), 1)
+
+            # Popping the generation restores router dispatch on the root.
+            with self.assertRaises(InvalidStatus) as raised:
+                async with connect(get_uri(server) + "/n"):
+                    self.fail("did not raise")
+            self.assertEqual(raised.exception.response.status_code, 404)
+
 
 @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "this test requires Unix sockets")
 @unittest.skipUnless("werkzeug" in sys.modules, "werkzeug not installed")

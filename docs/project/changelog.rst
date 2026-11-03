@@ -25,6 +25,27 @@ fixing regressions shortly after a release.
 Only documented APIs are public. Undocumented, private APIs may change without
 notice.
 
+.. _17.5:
+
+17.5
+----
+
+*Unreleased*
+
+New features
+............
+
+* Added nestable opening-handshake generations on the server with
+  :meth:`~asyncio.server.Server.generation` (asyncio and trio) and
+  :meth:`~sync.server.Server.generation` (threading). A generation binds
+  request interception intents (``process_request``) and response rewrite
+  intents (``process_response``) to connections whose opening handshake starts
+  while the generation is current. Pushing a generation starts a fresh ledger;
+  popping it seals it and restores the previous generation without affecting
+  connections already booked. Forced responses, the
+  :meth:`~server.ServerProtocol.accept` path (including rejects), response
+  rewrites, and the shutdown 503 gate remain separate stages.
+
 .. _17.4:
 
 17.4

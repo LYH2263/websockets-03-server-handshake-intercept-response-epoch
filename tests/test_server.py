@@ -3,6 +3,7 @@ import logging
 import re
 import sys
 import unittest
+import uuid
 from unittest.mock import patch
 
 from websockets.datastructures import Headers
@@ -22,6 +23,7 @@ from websockets.frames import TEXT, Frame
 from websockets.http11 import Request, Response
 from websockets.protocol import CONNECTING, OPEN
 from websockets.server import *
+from websockets.server import HandshakeGeneration, HandshakeStack
 
 from .extensions.utils import (
     OpExtension,
@@ -1082,6 +1084,82 @@ class HandshakeTests(unittest.TestCase):
         self.assertHandshakeSuccess(server)
         self.assertNotIn("Sec-WebSocket-Protocol", response.headers)
         self.assertIsNone(server.subprotocol)
+
+
+class HandshakeGenerationTests(unittest.TestCase):
+    """Test opening-handshake generation ledgers and stacks."""
+
+    def test_register_intents(self):
+        """process_request and process_response register distinct intents."""
+        generation = HandshakeGeneration()
+
+        @generation.process_request
+        def intercept(connection, request):
+            return None
+
+        @generation.process_response
+        def rewrite(connection, request, response):
+            return None
+
+        self.assertEqual(generation.request_interceptors, [intercept])
+        self.assertEqual(generation.response_rewriters, [rewrite])
+
+    def test_seal_rejects_new_intents(self):
+        """A sealed generation rejects new intents but stays readable."""
+        generation = HandshakeGeneration()
+        generation.book(uuid.uuid4())
+        generation.seal()
+        self.assertTrue(generation.sealed)
+        with self.assertRaisesRegex(RuntimeError, "sealed generation"):
+            generation.process_request(lambda connection, request: None)
+        with self.assertRaisesRegex(RuntimeError, "sealed generation"):
+            generation.process_response(lambda connection, request, response: None)
+
+    def test_book_unbook_and_notes(self):
+        """Ledgers record booked, intercepted, accepted, and rewritten ids."""
+        generation = HandshakeGeneration()
+        connection_id = uuid.uuid4()
+
+        generation.book(connection_id)
+        self.assertEqual(generation.booked, {connection_id})
+        generation.note_intercepted(connection_id)
+        generation.note_accepted(connection_id)
+        generation.note_rewritten(connection_id)
+        self.assertEqual(generation.intercepted, {connection_id})
+        self.assertEqual(generation.accepted, {connection_id})
+        self.assertEqual(generation.rewritten, {connection_id})
+
+        generation.unbook(connection_id)
+        self.assertEqual(generation.booked, set())
+        # Unbooking an unknown connection is a no-op.
+        generation.unbook(connection_id)
+
+    def test_stack_push_and_pop(self):
+        """Pushing shadows the current generation; popping seals and restores."""
+        root = HandshakeGeneration()
+        stack = HandshakeStack(root)
+        self.assertIs(stack.current, root)
+
+        child = HandshakeGeneration()
+        stack.push(child)
+        self.assertIs(stack.current, child)
+
+        popped = stack.pop()
+        self.assertIs(popped, child)
+        self.assertTrue(child.sealed)
+        self.assertIs(stack.current, root)
+
+    def test_accept_records_connection_on_generation(self):
+        """accept() books the connection on its generation, if any."""
+        generation = HandshakeGeneration()
+        server = ServerProtocol()
+        server.handshake_generation = generation
+        server.accept(make_request())
+        self.assertEqual(generation.accepted, {server.id})
+
+        # Without a generation, accept() doesn't touch ledgers.
+        server = ServerProtocol()
+        server.accept(make_request())
 
 
 class MiscTests(unittest.TestCase):
